@@ -23,7 +23,7 @@ trap 'rm -rf "$stage"' EXIT
 
 mkdir -p "$stage/bin" "$stage/scripts"
 cp "$src/manifest.json" "$src/Model.js" "$src/Service.qml" "$src/BarWidget.qml" "$src/Panel.qml" \
-  "$src/README.md" "$src/LICENSE" "$src/THIRD_PARTY_NOTICES.md" "$stage/"
+  "$src/README.md" "$src/LICENSE" "$src/THIRD_PARTY_NOTICES.md" "$src/preview.png" "$stage/"
 cp "$src/bin/upcoming-ops" "$stage/bin/"
 cp "$src/scripts/bounded-job-wrapper.sh" "$stage/scripts/"
 chmod 755 "$stage/bin/upcoming-ops" "$stage/scripts/bounded-job-wrapper.sh"

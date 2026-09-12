@@ -51,23 +51,30 @@ Item {
 
   Process {
     id: mkdir
-    command: ["mkdir", "-p", root.stateDir]
+    command: ["mkdir", "-p", "-m", "700", root.stateDir]
     running: false
     onExited: function(code) {
       root.dirReady = true
-      saveFile.reload()
+      readWatchlist()
     }
   }
 
-  FileView {
-    id: saveFile
-    path: root.savePath
-    watchChanges: false
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.applySave(text())
-    onLoadFailed: function(error) { root.applySave("") }
-    onSaveFailed: function(error) { root.lastError = root.conciseError(error, "Could not save the watchlist") }
+  function readWatchlist() {
+    if (readProcess.running) return
+    readProcess.command = ["head", "-c", "65536", root.savePath]
+    readProcess.running = true
+  }
+
+  property string _readOut: ""
+
+  Process {
+    id: readProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: readStdout; waitForEnd: true; onStreamFinished: root._readOut = text }
+    onExited: function(exitCode) {
+      root.applySave(exitCode === 0 ? String(readStdout.text || root._readOut || "") : "")
+    }
   }
 
   function applySave(raw) {
@@ -82,8 +89,30 @@ Item {
   function persist() {
     if (!loaded) return
     if (!dirReady) { pendingSave = true; return }
+    if (writeProcess.running) { pendingSave = true; return }
     var payload = JSON.stringify({ version: 1, shows: shows }, null, 1) + "\n"
-    saveFile.setText(payload)
+    // Same-directory temp + rename so a planted symlink at watchlist.json is
+    // replaced, never followed. mktemp is 0600; chmod 700 on the dir.
+    writeProcess.command = ["/bin/bash", "-c",
+      "set -e; d=\"$(dirname \"$0\")\"; mkdir -p -m 700 \"$d\"; " +
+      "tmp=\"$(mktemp \"$d/.watchlist.json.XXXXXX\")\"; chmod 600 \"$tmp\"; " +
+      "if head -c 65536 > \"$tmp\"; then mv -f \"$tmp\" \"$0\"; else rm -f \"$tmp\"; exit 1; fi",
+      root.savePath]
+    writeProcess.running = true
+    writeProcess.write(payload)
+    writeProcess.stdinEnabled = false
+    writeProcess.stdinEnabled = true
+  }
+
+  Process {
+    id: writeProcess
+    running: false
+    command: []
+    stdinEnabled: true
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not save the watchlist"
+      if (root.pendingSave) { root.pendingSave = false; root.persist() }
+    }
   }
 
   onDirReadyChanged: if (dirReady && pendingSave) { pendingSave = false; persist() }
