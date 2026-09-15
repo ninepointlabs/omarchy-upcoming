@@ -55,6 +55,9 @@ MAX_GRACE_SECONDS = 60
 # After SIGKILL, give uninterruptible processes this long to go before
 # exiting anyway.
 KILL_SETTLE_SECONDS = 5
+# Dispositions this supervisor changes, restored to default for the command.
+DEFAULT_SIGNALS = (signal.SIGPIPE, signal.SIGHUP, signal.SIGINT, signal.SIGTERM,
+                   signal.SIGCHLD, signal.SIGXFSZ)
 
 
 def fail(message, status=EXIT_USAGE):
@@ -160,25 +163,55 @@ class Supervisor:
     def spawn(self):
         out_r, out_w = os.pipe2(os.O_CLOEXEC)
         err_r, err_w = os.pipe2(os.O_CLOEXEC)
-        actions = [
-            (os.POSIX_SPAWN_DUP2, out_w, 1),
-            (os.POSIX_SPAWN_DUP2, err_w, 2),
-        ]
-        default_signals = [signal.SIGPIPE, signal.SIGHUP, signal.SIGINT, signal.SIGTERM,
-                           signal.SIGCHLD, signal.SIGXFSZ]
-        try:
-            self.leader = os.posix_spawn(self.command[0], self.command, command_environment(),
-                                         file_actions=actions, setsid=True,
-                                         setsigdef=default_signals, setsigmask=())
-        except FileNotFoundError:
-            fail("not found: " + self.command[0], EXIT_NOTFOUND)
-        except PermissionError:
-            fail("not executable: " + self.command[0], EXIT_NOEXEC)
-        except OSError as error:
-            fail("could not start " + self.command[0] + ": " + error.strerror)
-        finally:
-            os.close(out_w)
-            os.close(err_w)
+        # Carries exec's errno back to us; a successful exec closes it (CLOEXEC).
+        status_r, status_w = os.pipe2(os.O_CLOEXEC)
+        environment = command_environment()
+        supervisor = os.getpid()
+        pid = os.fork()
+        if pid == 0:
+            code = 0
+            try:
+                # Its own session and process group, so its PGID is its PID.
+                os.setsid()
+                # If this supervisor is killed outright (SIGKILL, OOM killer)
+                # it cannot clean up, and the command must not outlive it.
+                if (self.libc.prctl(PR_SET_PDEATHSIG, ctypes.c_ulong(signal.SIGKILL), 0, 0, 0) != 0
+                        or os.getppid() != supervisor):
+                    os._exit(EXIT_USAGE)
+                signal.set_wakeup_fd(-1)
+                for signum in DEFAULT_SIGNALS:
+                    signal.signal(signum, signal.SIG_DFL)
+                signal.pthread_sigmask(signal.SIG_SETMASK, [])
+                os.dup2(out_w, 1)
+                os.dup2(err_w, 2)
+                os.execve(self.command[0], self.command, environment)
+            except OSError as error:
+                code = error.errno or 0
+            try:
+                os.write(status_w, str(code).encode())
+            except OSError:
+                pass
+            os._exit(EXIT_NOTFOUND)
+        self.leader = pid
+        os.close(out_w)
+        os.close(err_w)
+        os.close(status_w)
+        report = b""
+        while True:
+            chunk = os.read(status_r, 32)
+            if not chunk:
+                break
+            report += chunk
+        os.close(status_r)
+        if report:
+            # exec failed: nothing was ever signalled, so reaping is safe.
+            os.waitid(os.P_PID, pid, os.WEXITED)
+            code = int(report) if report.isdigit() else 0
+            if code == errno.ENOENT:
+                fail("not found: " + self.command[0], EXIT_NOTFOUND)
+            if code in (errno.EACCES, errno.EPERM, errno.ENOEXEC):
+                fail("not executable: " + self.command[0], EXIT_NOEXEC)
+            fail("could not start " + self.command[0] + ": " + os.strerror(code))
         for fd in (out_r, err_r):
             os.set_blocking(fd, False)
         self.sources = {out_r: 1, err_r: 2}
@@ -351,6 +384,7 @@ class Supervisor:
     # -- main loop ---------------------------------------------------------
     def run(self):
         libc = ctypes.CDLL(None, use_errno=True)
+        self.libc = libc
         parent = os.getppid()
         set_prctl(libc, PR_SET_PDEATHSIG, signal.SIGTERM)
         if os.getppid() != parent:

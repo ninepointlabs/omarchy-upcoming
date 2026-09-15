@@ -74,6 +74,16 @@ sleep 0.2
 sleep 2
 gone "sleep 1001.7" && gone "bounded-run.*1001.7" && ok "parent death tears down job" || bad "parent death" "still running"
 
+env -i PATH=/usr/bin LC_ALL=C /usr/bin/python3 -I -S -B "$BR" --stdout-cap 100 --stderr-cap 100 --deadline 0 --grace 1 -- /usr/bin/sleep 1001.9 & sup=$!
+sleep 0.5; kill -KILL $sup; wait $sup 2>/dev/null
+sleep 0.3
+gone "sleep 1001.9" && ok "supervisor SIGKILLed -> command dies by parent-death signal" || bad "supervisor SIGKILL" "command survived"
+
+race=$(dirname "$0")/bounded-run-race.py
+if [ -f "$race" ]; then
+  if /usr/bin/python3 -I -B "$race" "$BR"; then ok "race harness: no signal to a non-owned or reaped target"; else bad "race harness" "see output above"; fi
+fi
+
 if command -v strace >/dev/null; then
   log=$(mktemp)
   env -i PATH=/usr/bin strace -f -qq -o "$log" -e trace=kill,waitid,posix_spawn,clone,clone3 "${PY[@]}" --stdout-cap 100 --stderr-cap 100 --deadline 1 --grace 1 -- /usr/bin/bash -c 'trap "" TERM; /usr/bin/sleep 1001.8 & wait' >/dev/null 2>&1
