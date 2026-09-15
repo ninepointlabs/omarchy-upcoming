@@ -281,10 +281,81 @@ function parseOps(text) {
   }
 }
 
-function opsCommand(scriptPath) {
-  return [
-    "/bin/bash", scriptPath,
-    "262144", "65536", "1", "--",
-    "python3", "-u"
-  ]
+// ---------------------------------------------------------------------------
+// Process boundary. Nothing is resolved through the session PATH: the only
+// interpreter ever started is one of these fixed absolute paths, probed in
+// order at startup, and every job runs under bin/bounded-run with a cleared
+// environment. If none of them exists the widget refuses to run anything.
+// ---------------------------------------------------------------------------
+
+var PYTHON_CANDIDATES = ["/usr/bin/python3", "/bin/python3", "/run/current-system/sw/bin/python3"]
+var TRUSTED_PATH = "/usr/bin:/bin:/run/current-system/sw/bin"
+var PYTHON_FLAGS = ["-I", "-S", "-B"]
+var KILL_GRACE_SECONDS = 2
+
+// Per job: stdout cap, stderr cap, deadline (seconds). A refresh walks up to
+// twenty-four shows at TVmaze's pace, so it gets the longest deadline.
+var JOB_LIMITS = {
+  load: [524288, 16384, 15],
+  save: [4096, 16384, 15],
+  search: [262144, 65536, 60],
+  add: [262144, 65536, 60],
+  refresh: [262144, 65536, 300]
+}
+
+function processEnvironment() {
+  return { PATH: TRUSTED_PATH, LC_ALL: "C.UTF-8" }
+}
+
+function trustedPython(path) {
+  var text = String(path || "")
+  return PYTHON_CANDIDATES.indexOf(text) >= 0 ? text : ""
+}
+
+function validPluginDir(path) {
+  var text = String(path || "")
+  if (text.charAt(0) !== "/" || /[\x00-\x1f\x7f]/.test(text) || /(^|\/)\.\.?(\/|$)/.test(text)) return ""
+  return text
+}
+
+function pythonProbeCommand(candidate) {
+  var python = trustedPython(candidate)
+  if (python === "") return []
+  return [python].concat(PYTHON_FLAGS, ["-c", "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 3)"])
+}
+
+// `kind` is one of JOB_LIMITS. Returns [] (a Process given [] starts nothing)
+// unless the interpreter is a probed trusted candidate.
+function helperCommand(python, pluginDir, kind) {
+  var interpreter = trustedPython(python)
+  var dir = validPluginDir(pluginDir)
+  var limits = JOB_LIMITS[kind]
+  if (interpreter === "" || dir === "" || !limits) return []
+  return [interpreter].concat(PYTHON_FLAGS, [dir + "/bin/bounded-run",
+    "--stdout-cap", String(limits[0]), "--stderr-cap", String(limits[1]),
+    "--deadline", String(limits[2]), "--grace", String(KILL_GRACE_SECONDS),
+    "--", interpreter], PYTHON_FLAGS, [dir + "/bin/upcoming-ops"])
+}
+
+// Supervisor exit codes (bin/bounded-run) → a message, or "" for the job's
+// own status. `what` names the other end: "TVmaze" or "The watchlist helper".
+function jobFailure(exitCode, what) {
+  var subject = what || "TVmaze"
+  if (exitCode === 124) return subject + " took too long to answer"
+  if (exitCode === 201) return subject + " sent more data than expected"
+  if (exitCode === 202) return subject + " error output was truncated"
+  if (exitCode >= 125 && exitCode <= 127) return "Could not start the Upcoming helper"
+  return ""
+}
+
+function parseLoad(text) {
+  var parsed
+  try { parsed = JSON.parse(String(text || "")) } catch (e) {
+    return { ok: false, error: "Could not read the watchlist", shows: [] }
+  }
+  if (!parsed || typeof parsed !== "object") return { ok: false, error: "Could not read the watchlist", shows: [] }
+  if (parsed.ok !== true) return { ok: false, error: conciseError(parsed.error, "Could not read the watchlist"), shows: [] }
+  var list = parseWatchlist(JSON.stringify(parsed.watchlist === undefined ? null : parsed.watchlist))
+  var warning = list.ok && parsed.error ? conciseError(parsed.error, "Watchlist file is not readable") : ""
+  return { ok: list.ok, shows: list.shows, error: list.ok ? warning : list.error }
 }

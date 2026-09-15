@@ -5,6 +5,12 @@ import "Model.js" as Model
 
 // One instance per shell: watchlist on disk plus TVmaze search/refresh.
 // Widgets and the panel all read this, so two monitors never fork the list.
+//
+// Process boundary: the only program this service starts is python3 from a
+// fixed absolute path (Model.PYTHON_CANDIDATES), always with the session
+// environment cleared. Every job runs bin/upcoming-ops under bin/bounded-run
+// (output caps, deadline, race-free process-group termination). There is no
+// shell and no PATH lookup; if no trusted python3 exists, nothing runs.
 Item {
   id: root
 
@@ -12,22 +18,25 @@ Item {
   property var settings: ({})
   property bool active: true
 
-  readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy-upcoming"
-  readonly property string savePath: stateDir + "/watchlist.json"
   readonly property string pluginDir: {
     var text = String(Qt.resolvedUrl("."))
-    if (text.indexOf("file://") === 0) text = text.substring(7)
+    if (text.indexOf("file://") === 0) text = decodeURIComponent(text.substring(7))
     if (text.length > 1 && text.charAt(text.length - 1) === "/") text = text.substring(0, text.length - 1)
     return text
   }
-  readonly property string opsPath: pluginDir + "/bin/upcoming-ops"
-  readonly property string wrapperPath: pluginDir + "/scripts/bounded-job-wrapper.sh"
+  readonly property var processEnvironment: Model.processEnvironment()
+
+  property string python: ""
+  property bool toolsReady: false
+  property string toolsError: ""
+  property int _pythonCandidate: 0
+  property bool _probeStarted: false
+  property bool _probeSettled: true
 
   property var shows: []
   property var hits: []
   property string query: ""
   property bool loaded: false
-  property bool dirReady: false
   property bool pendingSave: false
   property bool searching: false
   property bool refreshing: false
@@ -36,7 +45,7 @@ Item {
   property int revision: 0
   property double refreshedAtMs: 0
 
-  readonly property bool busy: searching || refreshing || opsProcess.running
+  readonly property bool busy: searching || refreshing || opsJob.running
   readonly property string barText: Model.barLabel(shows, Date.now())
   readonly property var nextShow: Model.soonest(shows, Date.now())
 
@@ -49,76 +58,108 @@ Item {
     return Model.conciseError(value, fallback)
   }
 
-  Process {
-    id: mkdir
-    command: ["mkdir", "-p", "-m", "700", root.stateDir]
-    running: false
-    onExited: function(code) {
-      root.dirReady = true
-      readWatchlist()
+  // ------------------------------------------------------ Trusted python --
+
+  function resolvePython() {
+    if (toolsReady || !_probeSettled) return
+    _pythonCandidate = 0
+    startPythonProbe()
+  }
+
+  function startPythonProbe() {
+    var candidates = Model.PYTHON_CANDIDATES
+    if (_pythonCandidate >= candidates.length) {
+      toolsError = "Python 3 was not found in " + candidates.join(", ")
+        + " — Upcoming will not run anything from your PATH"
+      lastError = toolsError
+      return
     }
+    _probeStarted = false
+    _probeSettled = false
+    pythonProbe.command = Model.pythonProbeCommand(candidates[_pythonCandidate])
+    pythonProbe.running = true
   }
-
-  function readWatchlist() {
-    if (readProcess.running) return
-    readProcess.command = ["head", "-c", "65536", root.savePath]
-    readProcess.running = true
-  }
-
-  property string _readOut: ""
 
   Process {
-    id: readProcess
+    id: pythonProbe
     running: false
     command: []
-    stdout: StdioCollector { id: readStdout; waitForEnd: true; onStreamFinished: root._readOut = text }
+    clearEnvironment: true
+    environment: root.processEnvironment
+    workingDirectory: "/"
+    onStarted: root._probeStarted = true
     onExited: function(exitCode) {
-      root.applySave(exitCode === 0 ? String(readStdout.text || root._readOut || "") : "")
+      if (root._probeSettled) return
+      root._probeSettled = true
+      // Missing or too old: try the next fixed path, never a wider search.
+      if (!root._probeStarted || exitCode !== 0) { root._pythonCandidate++; root.startPythonProbe(); return }
+      root.python = Model.trustedPython(Model.PYTHON_CANDIDATES[root._pythonCandidate])
+      root.toolsError = ""
+      root.toolsReady = root.python !== ""
+      if (root.toolsReady) root.loadWatchlist()
+    }
+    onRunningChanged: {
+      if (running || root._probeSettled || root._probeStarted) return
+      root._probeSettled = true
+      root._pythonCandidate++
+      root.startPythonProbe()
     }
   }
 
-  function applySave(raw) {
-    var parsed = Model.parseWatchlist(raw)
-    if (parsed.ok) shows = parsed.shows
-    else lastError = parsed.error
-    loaded = true
-    revision += 1
-    if (shows.length > 0) refresh()
+  // ----------------------------------------------------------- Watchlist --
+
+  function loadWatchlist() {
+    if (loaded || loadJob.running) return
+    if (!toolsReady) { resolvePython(); return }
+    if (!loadJob.start(Model.helperCommand(python, pluginDir, "load"), JSON.stringify({ op: "load" })))
+      lastError = "Could not start the Upcoming helper"
+  }
+
+  HelperJob {
+    id: loadJob
+    jobEnvironment: root.processEnvironment
+    onJobFinished: function(exitCode, stdoutText, stderrText) {
+      var failure = Model.jobFailure(exitCode, "The watchlist helper")
+      var parsed = Model.parseLoad(stdoutText)
+      if (failure !== "" || !parsed.ok) {
+        // Not marked loaded: nothing is saved over a watchlist we could not
+        // read safely. Refresh (or reopening) tries again.
+        root.lastError = root.conciseError(failure || parsed.error, "Could not read the watchlist")
+        return
+      }
+      root.shows = parsed.shows
+      root.lastError = parsed.error || ""
+      root.loaded = true
+      root.revision += 1
+      if (root.pendingSave) { root.pendingSave = false; root.persist() }
+      if (root.shows.length > 0) root.refresh()
+    }
   }
 
   function persist() {
     if (!loaded) return
-    if (!dirReady) { pendingSave = true; return }
-    if (writeProcess.running) { pendingSave = true; return }
-    var payload = JSON.stringify({ version: 1, shows: shows }, null, 1) + "\n"
-    // Same-directory temp + rename so a planted symlink at watchlist.json is
-    // replaced, never followed. mktemp is 0600; chmod 700 on the dir.
-    writeProcess.command = ["/bin/bash", "-c",
-      "set -e; d=\"$(dirname \"$0\")\"; mkdir -p -m 700 \"$d\"; " +
-      "tmp=\"$(mktemp \"$d/.watchlist.json.XXXXXX\")\"; chmod 600 \"$tmp\"; " +
-      "if head -c 65536 > \"$tmp\"; then mv -f \"$tmp\" \"$0\"; else rm -f \"$tmp\"; exit 1; fi",
-      root.savePath]
-    writeProcess.running = true
-    writeProcess.write(payload)
-    writeProcess.stdinEnabled = false
-    writeProcess.stdinEnabled = true
+    if (saveJob.running) { pendingSave = true; return }
+    var payload = JSON.stringify({ op: "save", watchlist: { version: 1, shows: shows } })
+    if (!saveJob.start(Model.helperCommand(python, pluginDir, "save"), payload))
+      lastError = "Could not save the watchlist"
   }
 
-  Process {
-    id: writeProcess
-    running: false
-    command: []
-    stdinEnabled: true
-    onExited: function(exitCode) {
-      if (exitCode !== 0) root.lastError = "Could not save the watchlist"
+  HelperJob {
+    id: saveJob
+    jobEnvironment: root.processEnvironment
+    onJobFinished: function(exitCode, stdoutText, stderrText) {
+      var failure = Model.jobFailure(exitCode, "The watchlist helper")
+      var parsed = Model.parseOps(stdoutText)
+      if (failure !== "" || exitCode !== 0 || !parsed.ok)
+        root.lastError = root.conciseError(failure || parsed.error, "Could not save the watchlist")
       if (root.pendingSave) { root.pendingSave = false; root.persist() }
     }
   }
 
-  onDirReadyChanged: if (dirReady && pendingSave) { pendingSave = false; persist() }
+  Component.onCompleted: if (active) loadWatchlist()
+  onActiveChanged: if (active && !loaded) loadWatchlist()
 
-  Component.onCompleted: if (active) mkdir.running = true
-  onActiveChanged: if (active && !loaded && !mkdir.running) mkdir.running = true
+  // ------------------------------------------------------------- TVmaze --
 
   function addShow(hit) {
     if (!hit || !Model.isPositiveId(hit.id)) return
@@ -154,7 +195,7 @@ Item {
   }
 
   function refresh() {
-    if (!loaded) return
+    if (!loaded) { loadWatchlist(); return }
     var ids = []
     for (var i = 0; i < shows.length; i++) ids.push(shows[i].id)
     if (ids.length === 0) {
@@ -167,38 +208,34 @@ Item {
 
   property var _pending: null
   property string _kind: ""
-  property string _payload: ""
-  property string _out: ""
-  property string _err: ""
 
   function runOps(payload, kind) {
-    if (opsProcess.running) {
+    if (!toolsReady) {
+      lastError = toolsError !== "" ? toolsError : "Still looking for Python 3"
+      resolvePython()
+      return
+    }
+    if (opsJob.running) {
       _pending = { payload: payload, kind: kind }
       return
     }
     _kind = kind
-    _payload = JSON.stringify(payload)
     searching = kind === "search"
     refreshing = kind === "refresh" || kind === "add"
-    _out = ""
-    _err = ""
-    // Query and show ids go over stdin, never argv. command is a fixed helper.
-    opsProcess.command = ["/bin/bash", wrapperPath, "262144", "65536", "1", "--", "python3", "-u", opsPath]
-    opsProcess.running = true
-    opsProcess.write(_payload)
-    opsProcess.stdinEnabled = false
-    opsProcess.stdinEnabled = true
+    // Query and show ids go over stdin, never argv.
+    if (!opsJob.start(Model.helperCommand(python, pluginDir, kind), JSON.stringify(payload))) {
+      searching = false
+      refreshing = false
+      _kind = ""
+      lastError = "Could not start the Upcoming helper"
+    }
   }
 
-  Process {
-    id: opsProcess
-    running: false
-    command: []
-    stdinEnabled: true
-    stdout: StdioCollector { id: opsStdout; waitForEnd: true; onStreamFinished: root._out = text }
-    stderr: StdioCollector { id: opsStderr; waitForEnd: true; onStreamFinished: root._err = text }
-    onExited: function(exitCode) {
-      root.finishOps(exitCode, String(opsStdout.text || root._out || ""), String(opsStderr.text || root._err || ""))
+  HelperJob {
+    id: opsJob
+    jobEnvironment: root.processEnvironment
+    onJobFinished: function(exitCode, stdoutText, stderrText) {
+      root.finishOps(exitCode, stdoutText, stderrText)
     }
   }
 
@@ -207,8 +244,8 @@ Item {
     refreshing = false
     var kind = _kind
     _kind = ""
-    if (exitCode === 201) { lastError = "TVmaze sent more data than expected"; flushPending(); return }
-    if (exitCode === 202) { lastError = "TVmaze error output was truncated"; flushPending(); return }
+    var failure = Model.jobFailure(exitCode, "TVmaze")
+    if (failure !== "") { lastError = failure; flushPending(); return }
     var parsed = Model.parseOps(stdoutText)
     if (exitCode !== 0 || !parsed.ok) {
       lastError = conciseError(parsed.error || stderrText, "Could not reach TVmaze")
