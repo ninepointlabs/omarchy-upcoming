@@ -3,46 +3,55 @@
 # widget or restart the shell — Keeley does that when Tim asks.
 
 set -euo pipefail
+# Only system tools, by absolute path; nothing from a user PATH directory.
+PATH=/usr/bin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH PYTHONPATH PYTHONHOME PYTHONSTARTUP
 
-src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-id="$(python3 - "$src/manifest.json" <<'PY'
-import json, sys
-print(json.load(open(sys.argv[1]))["id"])
+src="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd)"
+id="$(/usr/bin/python3 -I -S -B - "$src/manifest.json" <<'PY'
+import json, re, sys
+value = json.load(open(sys.argv[1]))["id"]
+if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,63}", value):
+    raise SystemExit("unexpected plugin id")
+print(value)
 PY
 )"
 parent="$HOME/.config/omarchy/plugins"
 dest="$parent/$id"
 
-if [ -L "$dest" ]; then
-  echo "Error: $dest is a symlink, not a plugin directory. Remove it and re-run." >&2
+if [ -L "$parent" ] || [ -L "$dest" ]; then
+  echo "Error: $dest (or its parent) is a symlink, not a plugin directory. Remove it and re-run." >&2
   exit 1
 fi
+/usr/bin/mkdir -p -m 700 "$parent"
 
-stage="$(mktemp -d "$parent/.upcoming.staging.XXXXXX")"
-trap 'rm -rf "$stage"' EXIT
+stage="$(/usr/bin/mktemp -d "$parent/.upcoming.staging.XXXXXX")"
+trap '/usr/bin/rm -rf "$stage"' EXIT
 
-mkdir -p "$stage/bin" "$stage/scripts"
-cp "$src/manifest.json" "$src/Model.js" "$src/Service.qml" "$src/BarWidget.qml" "$src/Panel.qml" \
+/usr/bin/mkdir -p "$stage/bin"
+/usr/bin/cp "$src/manifest.json" "$src/Model.js" "$src/Service.qml" "$src/HelperJob.qml" "$src/BarWidget.qml" "$src/Panel.qml" \
   "$src/README.md" "$src/LICENSE" "$src/THIRD_PARTY_NOTICES.md" "$src/preview.png" "$stage/"
-cp "$src/bin/upcoming-ops" "$stage/bin/"
-cp "$src/scripts/bounded-job-wrapper.sh" "$stage/scripts/"
-chmod 755 "$stage/bin/upcoming-ops" "$stage/scripts/bounded-job-wrapper.sh"
+/usr/bin/cp "$src/bin/upcoming-ops" "$src/bin/bounded-run" "$stage/bin/"
+/usr/bin/chmod 755 "$stage/bin/upcoming-ops" "$stage/bin/bounded-run"
 
-omarchy plugin validate "$stage"
+omarchy_bin=/usr/share/omarchy/bin/omarchy
+[ -x "$omarchy_bin" ] || omarchy_bin=/usr/bin/omarchy
+"$omarchy_bin" plugin validate "$stage"
 
 if [ -e "$dest" ]; then
   old="$parent/.upcoming.old.$$"
-  mv -f "$dest" "$old"
-  if mv -f "$stage" "$dest"; then
-    rm -rf "$old"
+  /usr/bin/mv -f "$dest" "$old"
+  if /usr/bin/mv -f "$stage" "$dest"; then
+    /usr/bin/rm -rf "$old"
   else
-    rm -rf "$dest" 2>/dev/null || true
-    mv -f "$old" "$dest"
+    /usr/bin/rm -rf "$dest" 2>/dev/null || true
+    /usr/bin/mv -f "$old" "$dest"
     echo "Error: install failed; restored the previous install." >&2
     exit 1
   fi
 else
-  mv -f "$stage" "$dest"
+  /usr/bin/mv -f "$stage" "$dest"
 fi
 trap - EXIT
 

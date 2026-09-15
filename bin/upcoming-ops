@@ -1,17 +1,31 @@
-#!/usr/bin/env python3
-"""TVmaze client for ninepointlabs.upcoming.
+#!/usr/bin/python3 -IS
+"""TVmaze client and watchlist store for ninepointlabs.upcoming.
 
-Reads one JSON object from stdin (never argv):
+Service.qml runs this as `<trusted python3> -I -S -B upcoming-ops` under
+bin/bounded-run, with a cleared environment. It reads one JSON object from
+stdin (never argv):
   {"op":"search","query":"silo"}
   {"op":"refresh","ids":[38052,169]}
   {"op":"show","id":38052}
+  {"op":"load"}
+  {"op":"save","watchlist":{"version":1,"shows":[...]}}
 
 Writes one JSON object to stdout. Remote HTML is stripped. No API key.
+
+The only argument accepted is `--home DIR`, used by the tests to point the
+watchlist store at a scratch directory; the shell never passes it, and the
+home directory otherwise comes from the password database, not $HOME.
 """
 from __future__ import annotations
 
+import errno
+import http.client
 import json
+import os
+import pwd
 import re
+import secrets
+import stat
 import sys
 import urllib.error
 import urllib.parse
@@ -22,13 +36,22 @@ HOST = "api.tvmaze.com"
 BASE = "https://" + HOST
 TIMEOUT = 20
 MAX_IDS = 24
+MAX_SHOWS = 24
 QUERY_MAX = 80
 BODY_MAX = 262144
+READ_CHUNK = 16384
 TAG = re.compile(r"<[^>]*>")
 CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
+# ~/.local/state/omarchy-upcoming/watchlist.json
+STATE_COMPONENTS = (".local", "state", "omarchy-upcoming")
+WATCHLIST_NAME = "watchlist.json"
+WATCHLIST_MAX = 65536
+
 
 class HostLimitedRedirect(urllib.request.HTTPRedirectHandler):
+    max_redirections = 3
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         parsed = urllib.parse.urlparse(newurl)
         if parsed.scheme != "https" or parsed.hostname != HOST:
@@ -38,7 +61,13 @@ class HostLimitedRedirect(urllib.request.HTTPRedirectHandler):
         )
 
 
-OPENER = urllib.request.build_opener(HostLimitedRedirect())
+# No ProxyHandler: the helper runs with a cleared environment and talks to
+# api.tvmaze.com directly.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), HostLimitedRedirect())
+
+
+class StoreError(Exception):
+    pass
 
 
 def clean(value, limit=200):
@@ -70,24 +99,51 @@ def read_request():
     return data
 
 
+# ---------------------------------------------------------------------------
+# HTTP: every body is capped while it is read, never after.
+# ---------------------------------------------------------------------------
+
+def read_capped(resp, limit):
+    length = resp.headers.get("Content-Length")
+    if length is not None:
+        try:
+            if int(length) > limit:
+                return None
+        except ValueError:
+            return None
+    chunks = []
+    total = 0
+    while True:
+        chunk = resp.read(min(READ_CHUNK, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            return None
+    return b"".join(chunks)
+
+
 def get(path):
     if not path.startswith("/"):
         fail("Invalid TVmaze path")
     req = urllib.request.Request(BASE + path, headers={"User-Agent": UA, "Accept": "application/json"})
     try:
         with OPENER.open(req, timeout=TIMEOUT) as resp:
-            body = resp.read(BODY_MAX + 1)
+            body = read_capped(resp, BODY_MAX)
     except urllib.error.HTTPError as exc:
+        # The error body is never read.
+        exc.close()
         if exc.code == 404:
             fail("Not found", 2)
         if exc.code == 429:
             fail("TVmaze asked us to slow down; try again in a minute", 3)
         fail(f"TVmaze HTTP {exc.code}", 4)
-    except urllib.error.URLError:
-        fail("Could not reach TVmaze", 5)
     except TimeoutError:
         fail("TVmaze timed out", 6)
-    if len(body) > BODY_MAX:
+    except (urllib.error.URLError, http.client.HTTPException, OSError):
+        fail("Could not reach TVmaze", 5)
+    if body is None:
         fail("TVmaze response too large", 7)
     try:
         return json.loads(body.decode("utf-8"))
@@ -206,7 +262,208 @@ def op_refresh(ids):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Watchlist store: every operation is relative to a held directory
+# descriptor. No pathname is resolved twice, no component is followed if it
+# is a symlink, and every opened object is checked by fstat before use.
+# ---------------------------------------------------------------------------
+
+def check_directory(fd, label, private=False):
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise StoreError(label + " is not a directory")
+    if info.st_uid != os.geteuid():
+        raise StoreError(label + " is not owned by you")
+    if info.st_mode & 0o022:
+        raise StoreError(label + " is writable by other users")
+    if private and info.st_mode & 0o077:
+        os.fchmod(fd, 0o700)
+
+
+def open_child_directory(parent_fd, name, label, private):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    for _attempt in range(2):
+        try:
+            fd = os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise StoreError(label + " is a symlink or not a directory") from None
+            raise StoreError("Could not open " + label) from None
+        try:
+            check_directory(fd, label, private)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+    raise StoreError("Could not create " + label)
+
+
+def home_directory(override):
+    if override is not None:
+        return override
+    return pwd.getpwuid(os.geteuid()).pw_dir
+
+
+def open_state_directory(home):
+    if not isinstance(home, str) or not home.startswith("/") or "\0" in home:
+        raise StoreError("Home directory is not an absolute path")
+    try:
+        # The home path itself comes from the password database (or the
+        # tests); everything below it is opened without following links.
+        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        raise StoreError("Could not open the home directory") from None
+    try:
+        check_directory(fd, "Home directory")
+        labels = ("~/.local", "~/.local/state", "~/.local/state/omarchy-upcoming")
+        for index, name in enumerate(STATE_COMPONENTS):
+            child = open_child_directory(fd, name, labels[index],
+                                         private=index == len(STATE_COMPONENTS) - 1)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_watchlist(dir_fd):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+    try:
+        fd = os.open(WATCHLIST_NAME, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise StoreError("watchlist.json is a symlink; refusing to read it") from None
+        raise StoreError("Could not open watchlist.json") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise StoreError("watchlist.json is not a regular file")
+        if info.st_uid != os.geteuid():
+            raise StoreError("watchlist.json is not owned by you")
+        if info.st_nlink != 1:
+            raise StoreError("watchlist.json has extra hard links")
+        if info.st_mode & 0o022:
+            raise StoreError("watchlist.json is writable by other users")
+        if info.st_mode & 0o077:
+            os.fchmod(fd, 0o600)
+        if info.st_size > WATCHLIST_MAX:
+            raise StoreError("watchlist.json is too large")
+        chunks = []
+        total = 0
+        while total <= WATCHLIST_MAX:
+            chunk = os.read(fd, min(READ_CHUNK, WATCHLIST_MAX + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > WATCHLIST_MAX:
+            raise StoreError("watchlist.json is too large")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_watchlist(dir_fd, data):
+    try:
+        existing = os.stat(WATCHLIST_NAME, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and (not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.geteuid()):
+        raise StoreError("watchlist.json is not a regular file you own; refusing to replace it")
+    temp = ".watchlist.json." + secrets.token_hex(12) + ".tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NOCTTY | os.O_CLOEXEC
+    try:
+        fd = os.open(temp, flags, 0o600, dir_fd=dir_fd)
+    except OSError:
+        raise StoreError("Could not create a temporary watchlist file") from None
+    published = False
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(temp, WATCHLIST_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        published = True
+        os.fsync(dir_fd)
+    except StoreError:
+        raise
+    except OSError:
+        raise StoreError("Could not save the watchlist") from None
+    finally:
+        if not published:
+            try:
+                os.unlink(temp, dir_fd=dir_fd)
+            except OSError:
+                pass
+
+
+def op_load(home):
+    try:
+        dir_fd = open_state_directory(home)
+        try:
+            raw = read_watchlist(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except StoreError as exc:
+        fail(str(exc), 9)
+    if raw is None or not raw.strip():
+        return {"ok": True, "watchlist": {"version": 1, "shows": []}}
+    # A safe file whose contents are damaged loads as empty (and is replaced
+    # on the next save); an unsafe file above fails closed instead.
+    unreadable = {"ok": True, "watchlist": {"version": 1, "shows": []},
+                  "error": "Watchlist file is not readable; starting empty"}
+    try:
+        watchlist = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return unreadable
+    if not isinstance(watchlist, (dict, list)):
+        return unreadable
+    return {"ok": True, "watchlist": watchlist}
+
+
+def op_save(home, watchlist):
+    if not isinstance(watchlist, dict) or not isinstance(watchlist.get("shows"), list):
+        fail("Watchlist must be an object with a shows list")
+    if len(watchlist["shows"]) > MAX_SHOWS:
+        fail("Too many shows")
+    data = (json.dumps({"version": 1, "shows": watchlist["shows"]}, ensure_ascii=True, indent=1) + "\n").encode("ascii")
+    if len(data) > WATCHLIST_MAX:
+        fail("Watchlist is too large to save")
+    try:
+        dir_fd = open_state_directory(home)
+        try:
+            write_watchlist(dir_fd, data)
+        finally:
+            os.close(dir_fd)
+    except StoreError as exc:
+        fail(str(exc), 9)
+    return {"ok": True}
+
+
+def parse_argv(argv):
+    if not argv:
+        return None
+    if len(argv) == 2 and argv[0] == "--home":
+        return argv[1]
+    fail("Unexpected arguments")
+
+
 def main():
+    home_override = parse_argv(sys.argv[1:])
     req = read_request()
     op = clean(req.get("op"), 16).lower()
     if op == "search":
@@ -215,6 +472,10 @@ def main():
         result = op_show(req.get("id"))
     elif op == "refresh":
         result = op_refresh(req.get("ids"))
+    elif op == "load":
+        result = op_load(home_directory(home_override))
+    elif op == "save":
+        result = op_save(home_directory(home_override), req.get("watchlist"))
     else:
         fail("Unknown operation")
     json.dump(result, sys.stdout, ensure_ascii=True, separators=(",", ":"))
