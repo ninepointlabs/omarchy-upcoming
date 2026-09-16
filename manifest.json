@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ninepointlabs.upcoming",
   "name": "Upcoming",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Ninepoint Labs",
   "license": "MIT",
   "description": "Watchlist of streaming and TV shows for Omarchy. Search TVmaze to pick the right title, then see when the next episode is due.",
