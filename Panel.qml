@@ -87,9 +87,20 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
+    Flickable {
+      id: panelFlick
+      anchors.fill: parent
+      contentWidth: width
+      contentHeight: mainColumn.implicitHeight
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
+      flickableDirection: Flickable.VerticalFlick
+      interactive: contentHeight > height
+      ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
     Column {
       id: mainColumn
-      width: parent.width
+      width: panelFlick.width
       spacing: Style.space(10)
 
       Item {
@@ -338,6 +349,7 @@ Panel {
           }
         }
       }
+    }
     }
     }
   }
