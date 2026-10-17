@@ -44,6 +44,7 @@ Item {
   property string actionStatus: ""
   property int revision: 0
   property double refreshedAtMs: 0
+  property string pythonVersion: ""
 
   readonly property bool busy: searching || refreshing || opsJob.running
   readonly property string barText: Model.barLabel(shows, Date.now())
@@ -128,6 +129,7 @@ Item {
         return
       }
       root.shows = parsed.shows
+      root.pythonVersion = parsed.python
       root.lastError = parsed.error || ""
       root.loaded = true
       root.revision += 1
