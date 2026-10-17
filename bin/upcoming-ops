@@ -420,19 +420,20 @@ def op_load(home):
             os.close(dir_fd)
     except StoreError as exc:
         fail(str(exc), 9)
+    python = "%d.%d.%d" % sys.version_info[:3]  # for the About page
     if raw is None or not raw.strip():
-        return {"ok": True, "watchlist": {"version": 1, "shows": []}}
+        return {"ok": True, "watchlist": {"version": 1, "shows": []}, "python": python}
     # A safe file whose contents are damaged loads as empty (and is replaced
     # on the next save); an unsafe file above fails closed instead.
     unreadable = {"ok": True, "watchlist": {"version": 1, "shows": []},
-                  "error": "Watchlist file is not readable; starting empty"}
+                  "error": "Watchlist file is not readable; starting empty", "python": python}
     try:
         watchlist = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return unreadable
     if not isinstance(watchlist, (dict, list)):
         return unreadable
-    return {"ok": True, "watchlist": watchlist}
+    return {"ok": True, "watchlist": watchlist, "python": python}
 
 
 def op_save(home, watchlist):

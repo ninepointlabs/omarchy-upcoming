@@ -13,6 +13,11 @@ No API key. The list lives in `~/.local/state/omarchy-upcoming/watchlist.json` (
 - **Bar chip** — the soonest upcoming episode among your list, e.g. `Silo · S4E1 Jul 9 2027`. Empty until you add a show.
 - **Click the chip** — search, pick a match, remove shows, refresh air dates.
 - **Middle-click the chip** — refresh without opening the panel.
+- **About** — the 󰋽 button at the top of the panel (or `qs -p /usr/share/omarchy/shell ipc call ninepointlabs.upcoming about`)
+  shows the version, the license (readable in place, with the third-party notices), the TVmaze data credit,
+  Nine Point Labs, what the widget does with your data, and the support address,
+  [help@ninepointlabs.com](mailto:help@ninepointlabs.com), with *Email*, *Copy* and *Copy version details* buttons.
+  <kbd>Esc</kbd> or the 󰅖 button goes back to the list.
 
 TVmaze tracks listed air dates, not “released on my service in my country”. Ended shows and titles with no date yet still sit on the list as ended / TBA.
 
@@ -72,6 +77,7 @@ Your watchlist in `~/.local/state/omarchy-upcoming/` is left in place.
 
 ```sh
 node tests/model.test.cjs              # model, process boundary, PATH-shadow checks, live TVmaze
+node tests/about.test.cjs              # About facts, support email, privacy names every host (offline)
 /usr/bin/python3 -I -B tests/store_test.py   # watchlist store: symlinks, FIFOs, modes, sizes
 tests/bounded-run.test.sh bin/bounded-run    # supervisor: caps, deadline, process-group cleanup
 ```

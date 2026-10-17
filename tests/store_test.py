@@ -86,6 +86,7 @@ class Store(unittest.TestCase):
         code, out = self.run_helper({"op": "load"})
         self.assertEqual(code, 0)
         self.assertEqual(out["watchlist"]["shows"], shows)
+        self.assertEqual(out["python"], "%d.%d.%d" % sys.version_info[:3])  # About page
 
     def test_existing_loose_modes_are_tightened(self):
         os.makedirs(self.state, 0o755)
@@ -284,6 +285,15 @@ class HttpCap(unittest.TestCase):
             handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example/")
         with self.assertRaises(urllib.error.HTTPError):
             handler.redirect_request(req, None, 302, "Found", {}, "http://api.tvmaze.com/")
+
+
+class About(unittest.TestCase):
+    def test_privacy_names_the_only_host(self):
+        with open(os.path.join(ROOT, "Model.js"), encoding="utf-8") as fh:
+            model = fh.read()
+        privacy = model[model.index("var PRIVACY"):model.index("function manifestVersion")]
+        self.assertEqual(ops.BASE, "https://" + ops.HOST)
+        self.assertIn(ops.HOST, privacy)
 
 
 if __name__ == "__main__":

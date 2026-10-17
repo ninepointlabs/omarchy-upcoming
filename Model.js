@@ -357,5 +357,72 @@ function parseLoad(text) {
   if (parsed.ok !== true) return { ok: false, error: conciseError(parsed.error, "Could not read the watchlist"), shows: [] }
   var list = parseWatchlist(JSON.stringify(parsed.watchlist === undefined ? null : parsed.watchlist))
   var warning = list.ok && parsed.error ? conciseError(parsed.error, "Watchlist file is not readable") : ""
-  return { ok: list.ok, shows: list.shows, error: list.ok ? warning : list.error }
+  var python = typeof parsed.python === "string" && /^[0-9]{1,3}(\.[0-9]{1,3}){1,2}$/.test(parsed.python) ? parsed.python : ""
+  return { ok: list.ok, shows: list.shows, error: list.ok ? warning : list.error, python: python }
+}
+
+// ---------------------------------------------------------------------------
+// About. The version is read from manifest.json and the license text from
+// LICENSE at runtime; these are the facts that live nowhere else.
+// ---------------------------------------------------------------------------
+
+var ABOUT = {
+  name: "Upcoming",
+  tagline: "Watchlist of streaming and TV shows for Omarchy, with the next episode's air date",
+  organization: "Nine Point Labs",
+  supportEmail: "help@ninepointlabs.com",
+  created: "September 2026", // first commit: 2026-09-11
+  license: "MIT License",
+  copyright: "\u00a9 2026 Nine Point Labs", // as written in LICENSE
+  dataCredit: "Show and episode data from TVmaze, licensed CC BY-SA 4.0",
+  dataUrl: "https://www.tvmaze.com/" // TVmaze asks for a link back; opened in the browser, never fetched
+}
+
+var PRIVACY = "No account, no API key and no telemetry. The widget connects only to api.tvmaze.com, over HTTPS: "
+  + "what you type in the search box and the TVmaze ids of the shows on your list are sent there to look up "
+  + "shows and air dates. No images are downloaded. Your watchlist stays on this computer in "
+  + "~/.local/state/omarchy-upcoming/watchlist.json (0600); the chip setting is saved in ~/.config/omarchy/shell.json."
+
+// "0.1.1" from manifest.json's text, or "" if it cannot be read.
+function manifestVersion(text) {
+  var parsed
+  try { parsed = JSON.parse(String(text || "")) } catch (e) { return "" }
+  var version = parsed && typeof parsed.version === "string" ? parsed.version : ""
+  return /^[0-9A-Za-z.+-]{1,32}$/.test(version) ? version : ""
+}
+
+// Highest minor version `has(major, minor)` accepts, as "major.minor"
+// (Quickshell.hasVersion / hasQtVersion only answer yes or no), or "".
+function probedVersion(has, major) {
+  if (typeof has !== "function" || !has(major, 0)) return ""
+  var minor = 0
+  while (minor < 99 && has(major, minor + 1)) minor++
+  return major + "." + minor
+}
+
+// One paragraph per line, so the license wraps to the panel width.
+function reflowLicense(text) {
+  var paragraphs = String(text || "").split(/\n\s*\n/)
+  var out = []
+  for (var i = 0; i < paragraphs.length; i++) {
+    var p = paragraphs[i].replace(/\s+/g, " ").trim()
+    if (p !== "") out.push(p)
+  }
+  return out.join("\n\n")
+}
+
+// Version details for a support email.
+function aboutDetails(version, quickshell, qt, python, platform) {
+  var built = []
+  if (quickshell) built.push("Quickshell " + quickshell)
+  if (qt) built.push("Qt " + qt)
+  if (python) built.push("Python " + python)
+  return ABOUT.name + " " + (version || "unknown version") + "\n"
+    + (built.length > 0 ? built.join(", ") : "versions unknown") + "\n"
+    + (platform || "unknown platform")
+}
+
+function supportMailto(version, details) {
+  return "mailto:" + ABOUT.supportEmail + "?subject=" + encodeURIComponent(ABOUT.name + " " + (version || ""))
+    + "&body=" + encodeURIComponent("\n\n--\n" + details)
 }
